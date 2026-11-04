@@ -41,7 +41,7 @@ jobs:
         run: bash scripts/prepare-voxl-mac.sh voxl/target/release/voxl
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
       - run: npm ci
       - name: Build the app
@@ -103,7 +103,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
       - run: npm ci
       - name: Build the app
