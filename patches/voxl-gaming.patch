@@ -1,8 +1,8 @@
 diff --git a/README.md b/README.md
-index 6c7394c..03cd874 100644
+index 6c7394c..123d7e9 100644
 --- a/README.md
 +++ b/README.md
-@@ -132,6 +132,17 @@ scrolling. voxl accepts selkies' command-line flags; other selkies flags are ign
+@@ -132,6 +132,19 @@ scrolling. voxl accepts selkies' command-line flags; other selkies flags are ign
  | `--max-record-seconds`                                         | `300`                              | longest recording (`/record`)                                                                                     |
  | `--convert-threads`, `--coalesce-us`                           | `4`, `0`                           | tuning                                                                                                            |
  
@@ -13,7 +13,9 @@ index 6c7394c..03cd874 100644
 +pointer, and the mouse sends relative motion (`mr,dx,dy`) instead of positions;
 +clicks and the wheel still work. Hold W and press P to pause; leaving the lock any
 +other way (Esc, switching windows) pauses too. Pausing releases every held key and
-+button and stops input until you press Resume; Leave closes the window. The relative
++button and stops input until you press Resume; Exit game mode goes back to the
++normal mouse, and Leave closes the window. If the browser refuses to lock the mouse
++three times in a row, game mode turns itself off. The relative
 +motion is real on Windows (`SendInput`) and X11 (XTEST); on macOS the cursor moves
 +by the delta, clamped to the display, with the motion in the event's delta fields.
 +
@@ -73,7 +75,7 @@ index a1ac7d4..8e89279 100644
  pub const kCGScrollWheelEventIsContinuous: u32 = 88;
  
 diff --git a/src/mac/input.rs b/src/mac/input.rs
-index ced9add..f27705e 100644
+index ced9add..6158995 100644
 --- a/src/mac/input.rs
 +++ b/src/mac/input.rs
 @@ -13,6 +13,11 @@ pub enum InputEvent {
@@ -88,16 +90,19 @@ index ced9add..f27705e 100644
      Button {
          button: u8,
          down: bool,
-@@ -166,6 +171,8 @@ struct Injector {
+@@ -166,6 +171,11 @@ struct Injector {
      last_click: (Instant, CGPoint, u8),
      clicks: i64,
      scroll_acc: (f64, f64),
 +    /// Relative motion in points not yet sent in the integer delta fields.
 +    rel_acc: (f64, f64),
++    /// The last motion was relative, so the app (a game re-centring the cursor) may
++    /// have moved the cursor away from `pos` since.
++    rel_moved: bool,
      clipboard: Option<super::desktop::ClipboardHandle>,
  }
  
-@@ -197,6 +204,12 @@ impl Injector {
+@@ -197,6 +207,12 @@ impl Injector {
      }
  
      fn mouse(&self, ty: u32, button: u32) {
@@ -110,7 +115,7 @@ index ced9add..f27705e 100644
          let e = unsafe { CGEventCreateMouseEvent(self.src, ty, self.pos, button) };
          if e.is_null() {
              return;
-@@ -207,10 +220,40 @@ impl Injector {
+@@ -207,10 +223,40 @@ impl Injector {
                  CGEventSetIntegerValueField(e, kCGMouseEventClickState, self.clicks);
              }
              CGEventSetIntegerValueField(e, kCGMouseEventButtonNumber, button as i64);
@@ -151,7 +156,7 @@ index ced9add..f27705e 100644
      fn key_event(&self, kc: u16, down: bool, flags: u64, repeat: bool) {
          let e = unsafe { CGEventCreateKeyboardEvent(self.src, kc, down) };
          if e.is_null() {
-@@ -245,17 +288,31 @@ impl Injector {
+@@ -245,18 +291,39 @@ impl Injector {
          match ev {
              InputEvent::Move { x, y } => {
                  self.pos = self.to_point(x, y);
@@ -164,6 +169,7 @@ index ced9add..f27705e 100644
 -                } else {
 -                    (kCGEventMouseMoved, 0)
 -                };
++                self.rel_moved = false;
 +                let (ty, b) = self.motion_type();
                  self.mouse(ty, b);
              }
@@ -175,6 +181,7 @@ index ced9add..f27705e 100644
 +                // delta fields carry whole points, with the remainder kept for later.
 +                let k = 1.0 / g.scale();
 +                let (mx, my) = (dx as f64 * k, dy as f64 * k);
++                self.rel_moved = true;
 +                self.rel_acc.0 += mx;
 +                self.rel_acc.1 += my;
 +                let (ix, iy) = (self.rel_acc.0.trunc(), self.rel_acc.1.trunc());
@@ -190,13 +197,20 @@ index ced9add..f27705e 100644
 +                self.mouse_delta(ty, button, Some((ix as i64, iy as i64)));
 +            }
              InputEvent::Button { button, down } => {
++                // Click where the cursor really is. (Scroll events carry no position:
++                // macOS posts them at the cursor.)
++                if self.rel_moved {
++                    self.pos = self.cursor_location();
++                }
                  let b = button as usize;
                  if b >= self.buttons.len() || self.buttons[b] == down {
-@@ -457,6 +514,7 @@ pub fn spawn(
+                     return;
+@@ -457,6 +524,8 @@ pub fn spawn(
          last_click: (Instant::now(), CGPoint::default(), 0),
          clicks: 1,
          scroll_acc: (0.0, 0.0),
 +        rel_acc: (0.0, 0.0),
++        rel_moved: false,
          clipboard,
      };
      let (tx, rx) = mpsc::channel::<InputEvent>();
@@ -339,7 +353,7 @@ index 5aa0201..9ea80d4 100644
                  let b = button as usize;
                  if b >= self.buttons.len() || self.buttons[b] == down {
 diff --git a/web/index.html b/web/index.html
-index 0f87033..c31fb3d 100644
+index 0f87033..45699e6 100644
 --- a/web/index.html
 +++ b/web/index.html
 @@ -205,7 +205,9 @@
@@ -353,7 +367,7 @@ index 0f87033..c31fb3d 100644
  				display: none !important;
  			}
  			/* While the microphone is live the toolbar stays up as a recording indicator. */
-@@ -540,6 +542,69 @@
+@@ -540,6 +542,91 @@
  				color: var(--text-weak);
  			}
  
@@ -420,10 +434,32 @@ index 0f87033..c31fb3d 100644
 +				display: none;
 +			}
 +
++			/* Game mode: a lock that failed, shown briefly over the desktop. */
++			#game-toast {
++				position: fixed;
++				left: 50%;
++				bottom: 24px;
++				transform: translateX(-50%);
++				z-index: 6;
++				padding: 8px 12px;
++				background: var(--surface-raised);
++				border: 1px solid var(--border-default);
++				border-radius: 10px;
++				box-shadow: var(--shadow-lg);
++				color: var(--text-strong);
++				font: 520 13px/16px var(--font);
++				letter-spacing: -0.2px;
++				pointer-events: none;
++				display: none;
++			}
++			#game-toast.show {
++				display: block;
++			}
++
  			/* Drop target: a dialog-style card over a scrim. */
  			#drop {
  				position: fixed;
-@@ -661,6 +726,22 @@
+@@ -661,6 +748,22 @@
  						stroke-linejoin="round" />
  				</svg>
  			</button>
@@ -446,7 +482,7 @@ index 0f87033..c31fb3d 100644
  			<button
  				id="fs-btn"
  				class="ib"
-@@ -798,6 +879,23 @@
+@@ -798,6 +901,27 @@
  				</div>
  			</div>
  		</div>
@@ -458,6 +494,9 @@ index 0f87033..c31fb3d 100644
 +						<button id="game-resume" class="btn primary" type="button">
 +							<span>Resume</span>
 +						</button>
++						<button id="game-exit" class="btn ghost" type="button">
++							<span>Exit game mode</span>
++						</button>
 +						<button id="game-leave" class="btn ghost" type="button">
 +							<span>Leave</span>
 +						</button>
@@ -467,6 +506,7 @@ index 0f87033..c31fb3d 100644
 +				</div>
 +			</div>
 +		</div>
++		<div id="game-toast" role="status"></div>
  		<div id="status">Connecting…</div>
  		<div id="stats"></div>
  		<script src="client.js"></script>
@@ -492,14 +532,15 @@ index 429f035..58d4a7d 100644
  export function el<T extends HTMLElement = HTMLElement>(id: string): T {
 diff --git a/web/src/client/game.ts b/web/src/client/game.ts
 new file mode 100644
-index 0000000..99cdec6
+index 0000000..cf7f780
 --- /dev/null
 +++ b/web/src/client/game.ts
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,220 @@
 +// Game mode (?game=1, or the toolbar button): a click locks the pointer to the desktop
 +// and the mouse sends relative motion, for games with mouse-look. Hold W and press P,
 +// or lose the lock any other way (Esc, switching windows), to pause: held keys and
-+// buttons are released, input stops, and an overlay offers Resume and Leave.
++// buttons are released, input stops, and an overlay offers Resume, Exit game mode and
++// Leave.
 +import { cmd } from '../protocol';
 +import type { App } from './app';
 +import { el } from './app';
@@ -519,8 +560,23 @@ index 0000000..99cdec6
 +	const overlay = el('game-pause');
 +	const resumeBtn = el<HTMLButtonElement>('game-resume');
 +	const leaveBtn = el<HTMLButtonElement>('game-leave');
++	const exitBtn = el<HTMLButtonElement>('game-exit');
 +	const note = el('game-note');
++	const toast = el('game-toast');
 +	const canLock = 'requestPointerLock' in surface;
++	/** Chrome reports a jump on the first motion after a lock: skip that event. */
++	let skipNext = false;
++	/** Clicks on the desktop that failed to lock the pointer in a row. */
++	let failures = 0;
++	/** The latest lock attempt, so a stale one doesn't report. */
++	let attempt = 0;
++	let toastTimer: ReturnType<typeof setTimeout> | undefined;
++	function showToast(text: string) {
++		toast.textContent = text;
++		toast.classList.add('show');
++		clearTimeout(toastTimer);
++		toastTimer = setTimeout(() => toast.classList.remove('show'), 4000);
++	}
 +
 +	// Relative motion in desktop pixels, sent once per frame in whole pixels; the
 +	// fractions carry over.
@@ -538,6 +594,12 @@ index 0000000..99cdec6
 +	}
 +	function motion(e: PointerEvent) {
 +		if (!app.desk.w || app.game.paused) return;
++		if (skipNext) {
++			skipNext = false;
++			return;
++		}
++		// A real mouse doesn't move this far between two events: a spurious jump.
++		if (Math.abs(e.movementX) > 500 || Math.abs(e.movementY) > 500) return;
 +		// movementX/Y are CSS pixels: devicePixelRatio device pixels each, while the
 +		// desktop shows desk.w / width desktop pixels per CSS pixel, i.e. that over dpr
 +		// per device pixel. The two dprs cancel, so the remote cursor moves as far
@@ -566,6 +628,48 @@ index 0000000..99cdec6
 +		return true;
 +	}
 +
++	/**
++	 * Resolves once the browser has answered a lock request: locked, refused (some
++	 * browsers only say so with a pointerlockerror event), or no answer within 500 ms.
++	 */
++	function answered(): Promise<void> {
++		return new Promise((resolve) => {
++			if (app.game.locked) {
++				resolve();
++				return;
++			}
++			const done = () => {
++				clearTimeout(timer);
++				document.removeEventListener('pointerlockchange', done);
++				document.removeEventListener('pointerlockerror', done);
++				resolve();
++			};
++			const timer = setTimeout(done, 500);
++			document.addEventListener('pointerlockchange', done);
++			document.addEventListener('pointerlockerror', done);
++		});
++	}
++
++	/** Locks the pointer; true when it worked. */
++	async function tryLock(): Promise<boolean> {
++		const id = ++attempt;
++		await lock();
++		await answered();
++		return id !== attempt || app.game.locked;
++	}
++
++	/** A click on the desktop locks the pointer; tell the viewer when that fails. */
++	async function lockFromClick() {
++		if (await tryLock()) return;
++		failures++;
++		if (failures >= 3) {
++			// Clicks would otherwise keep being taken for locking: give them back.
++			setOn(false);
++			showToast("Couldn't lock the mouse, so game mode is off.");
++		} else
++			showToast("Couldn't lock the mouse. Click again, or exit game mode.");
++	}
++
 +	function showOverlay(show: boolean) {
 +		overlay.classList.toggle('show', show);
 +		if (show) resumeBtn.focus({ preventScroll: true });
@@ -592,6 +696,7 @@ index 0000000..99cdec6
 +
 +	function setOn(on: boolean) {
 +		app.game.on = on;
++		failures = 0;
 +		btn.classList.toggle('on', on);
 +		btn.setAttribute('aria-pressed', String(on));
 +		if (on) return;
@@ -603,7 +708,12 @@ index 0000000..99cdec6
 +		const locked = document.pointerLockElement === surface;
 +		if (locked === app.game.locked) return;
 +		app.game.locked = locked;
-+		if (locked) resumed();
++		if (locked) {
++			skipNext = true;
++			failures = 0;
++			toast.classList.remove('show');
++			resumed();
++		}
 +		// Esc, switching windows or the browser taking the lock back: same as W + P.
 +		else if (app.game.on) pause();
 +	});
@@ -611,9 +721,12 @@ index 0000000..99cdec6
 +	resumeBtn.addEventListener('click', async () => {
 +		note.textContent = '';
 +		// Browsers refuse a new lock right after the viewer pressed Esc.
-+		if (!(await lock()) && app.game.paused)
-+			note.textContent = 'Click Resume again';
++		if (!(await tryLock()) && app.game.paused)
++			note.textContent =
++				"Couldn't lock the mouse. Click Resume again, or exit game mode.";
 +	});
++	// The overlay covers the toolbar, so it offers the way out of game mode too.
++	exitBtn.addEventListener('click', () => setOn(false));
 +	leaveBtn.addEventListener('click', () => {
 +		window.close();
 +		// Scripts may only close windows they opened; a normal tab stays.
@@ -636,7 +749,7 @@ index 0000000..99cdec6
 +				e.pointerType !== 'mouse'
 +			)
 +				return false;
-+			void lock();
++			void lockFromClick();
 +			return true;
 +		},
 +		motion,
@@ -644,7 +757,7 @@ index 0000000..99cdec6
 +	};
 +}
 diff --git a/web/src/client/keyboard.ts b/web/src/client/keyboard.ts
-index 4d091e7..20fa86e 100644
+index 4d091e7..f5fe383 100644
 --- a/web/src/client/keyboard.ts
 +++ b/web/src/client/keyboard.ts
 @@ -3,6 +3,7 @@
@@ -665,7 +778,7 @@ index 4d091e7..20fa86e 100644
  ) {
  	const { kbd, surface, send, isMac } = app;
  	const XK_CONTROL_L = 0xffe3,
-@@ -117,6 +119,16 @@ export function setupKeyboard(
+@@ -117,6 +119,14 @@ export function setupKeyboard(
  		down.clear();
  		send(cmd.releaseAll);
  	}
@@ -677,39 +790,26 @@ index 4d091e7..20fa86e 100644
 +		}
 +		for (const code of down.keys()) release(code);
 +	}
-+	/** P of the W + P pause chord went down: its keyup stays here too. */
-+	let chordUp = false;
  	function flushPaste() {
  		if (!pendingPaste) return;
  		const p = pendingPaste;
-@@ -126,7 +138,14 @@ export function setupKeyboard(
+@@ -126,7 +136,14 @@ export function setupKeyboard(
  	}
  
  	function onKeyDown(e: KeyboardEvent) {
 -		if (e.isComposing) return;
 +		if (e.isComposing || app.game.paused) return;
 +		// Game mode: P while W is held pauses (physical keys, whatever the layout).
-+		if (app.game.on && e.code === 'KeyP' && down.has('KeyW')) {
++		// The chord's P never enters `down`, so its keyup sends nothing.
++		if (app.game.on && !app.readOnly && e.code === 'KeyP' && down.has('KeyW')) {
 +			e.preventDefault();
-+			chordUp = true;
 +			game.pause();
 +			return;
 +		}
  		onInteract();
  		const ks = keysymOf(e);
  		if (!ks) return;
-@@ -147,6 +166,10 @@ export function setupKeyboard(
- 	}
- 	function onKeyUp(e: KeyboardEvent) {
- 		e.preventDefault();
-+		if (chordUp && e.code === 'KeyP') {
-+			chordUp = false;
-+			return;
-+		}
- 		if (pendingPaste && pendingPaste.code === e.code) flushPaste();
- 		release(e.code);
- 		// macOS swallows keyups of keys released while Cmd is held.
-@@ -218,5 +241,5 @@ export function setupKeyboard(
+@@ -218,5 +235,5 @@ export function setupKeyboard(
  	surface.addEventListener('focus', () => kbd.focus({ preventScroll: true }));
  	if (!app.inIframe) kbd.focus({ preventScroll: true });
  
