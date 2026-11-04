@@ -1,0 +1,875 @@
+diff --git a/README.md b/README.md
+index 6c7394c..03cd874 100644
+--- a/README.md
++++ b/README.md
+@@ -132,6 +132,17 @@ scrolling. voxl accepts selkies' command-line flags; other selkies flags are ign
+ | `--max-record-seconds`                                         | `300`                              | longest recording (`/record`)                                                                                     |
+ | `--convert-threads`, `--coalesce-us`                           | `4`, `0`                           | tuning                                                                                                            |
+ 
++### Game mode
++
++For games with mouse-look, add `game=1` to the page's link (`?token=…&game=1`) or
++press the gamepad button in the toolbar. A click on the desktop then locks the mouse
++pointer, and the mouse sends relative motion (`mr,dx,dy`) instead of positions;
++clicks and the wheel still work. Hold W and press P to pause; leaving the lock any
++other way (Esc, switching windows) pauses too. Pausing releases every held key and
++button and stops input until you press Resume; Leave closes the window. The relative
++motion is real on Windows (`SendInput`) and X11 (XTEST); on macOS the cursor moves
++by the delta, clamped to the display, with the motion in the event's delta fields.
++
+ ### Login
+ 
+ voxl asks for a password before it shows the desktop or takes input, files or API
+diff --git a/src/input.rs b/src/input.rs
+index e958716..5da7223 100644
+--- a/src/input.rs
++++ b/src/input.rs
+@@ -16,6 +16,11 @@ pub enum InputEvent {
+         x: i32,
+         y: i32,
+     },
++    /// Relative motion in desktop pixels (game mode, pointer locked in the viewer).
++    MoveRel {
++        dx: i32,
++        dy: i32,
++    },
+     Button {
+         button: u8,
+         down: bool,
+@@ -352,6 +357,13 @@ impl Injector {
+             InputEvent::Move { x, y } => {
+                 self.fake(xproto::MOTION_NOTIFY_EVENT, 0, x as i16, y as i16)
+             }
++            // XTEST motion with detail 1 is relative: x and y are the deltas.
++            InputEvent::MoveRel { dx, dy } => self.fake(
++                xproto::MOTION_NOTIFY_EVENT,
++                1,
++                dx.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
++                dy.clamp(i16::MIN as i32, i16::MAX as i32) as i16,
++            ),
+             InputEvent::Button { button, down } => {
+                 if (button as usize) < self.buttons.len() {
+                     if self.buttons[button as usize] == down {
+diff --git a/src/mac/ffi.rs b/src/mac/ffi.rs
+index a1ac7d4..8e89279 100644
+--- a/src/mac/ffi.rs
++++ b/src/mac/ffi.rs
+@@ -130,6 +130,8 @@ extern "C" {
+         wheel2: i32,
+         wheel3: i32,
+     ) -> CGEventRef;
++    pub fn CGEventCreate(source: CGEventSourceRef) -> CGEventRef;
++    pub fn CGEventGetLocation(e: CGEventRef) -> CGPoint;
+     pub fn CGEventSetType(e: CGEventRef, ty: u32);
+     pub fn CGEventSetFlags(e: CGEventRef, flags: u64);
+     pub fn CGEventSetIntegerValueField(e: CGEventRef, field: u32, value: i64);
+@@ -169,6 +171,8 @@ pub const kCGEventOtherMouseDragged: u32 = 27;
+ 
+ pub const kCGMouseEventClickState: u32 = 1;
+ pub const kCGMouseEventButtonNumber: u32 = 3;
++pub const kCGMouseEventDeltaX: u32 = 4;
++pub const kCGMouseEventDeltaY: u32 = 5;
+ pub const kCGKeyboardEventAutorepeat: u32 = 8;
+ pub const kCGScrollWheelEventIsContinuous: u32 = 88;
+ 
+diff --git a/src/mac/input.rs b/src/mac/input.rs
+index ced9add..f27705e 100644
+--- a/src/mac/input.rs
++++ b/src/mac/input.rs
+@@ -13,6 +13,11 @@ pub enum InputEvent {
+         x: i32,
+         y: i32,
+     },
++    /// Relative motion in desktop pixels (game mode, pointer locked in the viewer).
++    MoveRel {
++        dx: i32,
++        dy: i32,
++    },
+     Button {
+         button: u8,
+         down: bool,
+@@ -166,6 +171,8 @@ struct Injector {
+     last_click: (Instant, CGPoint, u8),
+     clicks: i64,
+     scroll_acc: (f64, f64),
++    /// Relative motion in points not yet sent in the integer delta fields.
++    rel_acc: (f64, f64),
+     clipboard: Option<super::desktop::ClipboardHandle>,
+ }
+ 
+@@ -197,6 +204,12 @@ impl Injector {
+     }
+ 
+     fn mouse(&self, ty: u32, button: u32) {
++        self.mouse_delta(ty, button, None);
++    }
++
++    /// A mouse event at `self.pos`; `delta` sets its integer motion fields, which games
++    /// read for mouse-look.
++    fn mouse_delta(&self, ty: u32, button: u32, delta: Option<(i64, i64)>) {
+         let e = unsafe { CGEventCreateMouseEvent(self.src, ty, self.pos, button) };
+         if e.is_null() {
+             return;
+@@ -207,10 +220,40 @@ impl Injector {
+                 CGEventSetIntegerValueField(e, kCGMouseEventClickState, self.clicks);
+             }
+             CGEventSetIntegerValueField(e, kCGMouseEventButtonNumber, button as i64);
++            if let Some((dx, dy)) = delta {
++                CGEventSetIntegerValueField(e, kCGMouseEventDeltaX, dx);
++                CGEventSetIntegerValueField(e, kCGMouseEventDeltaY, dy);
++            }
+         }
+         self.post(e);
+     }
+ 
++    /// Motion event type and button for the buttons held: drags while one is down.
++    fn motion_type(&self) -> (u32, u32) {
++        if self.buttons[1] {
++            (kCGEventLeftMouseDragged, 0)
++        } else if self.buttons[3] {
++            (kCGEventRightMouseDragged, 1)
++        } else if self.buttons[2] {
++            (kCGEventOtherMouseDragged, 2)
++        } else {
++            (kCGEventMouseMoved, 0)
++        }
++    }
++
++    /// Where the cursor is now (the local user or the app may have moved it).
++    fn cursor_location(&self) -> CGPoint {
++        unsafe {
++            let e = CGEventCreate(std::ptr::null_mut());
++            if e.is_null() {
++                return self.pos;
++            }
++            let p = CGEventGetLocation(e);
++            CFRelease(e as CFTypeRef);
++            p
++        }
++    }
++
+     fn key_event(&self, kc: u16, down: bool, flags: u64, repeat: bool) {
+         let e = unsafe { CGEventCreateKeyboardEvent(self.src, kc, down) };
+         if e.is_null() {
+@@ -245,17 +288,31 @@ impl Injector {
+         match ev {
+             InputEvent::Move { x, y } => {
+                 self.pos = self.to_point(x, y);
+-                let (ty, b) = if self.buttons[1] {
+-                    (kCGEventLeftMouseDragged, 0)
+-                } else if self.buttons[3] {
+-                    (kCGEventRightMouseDragged, 1)
+-                } else if self.buttons[2] {
+-                    (kCGEventOtherMouseDragged, 2)
+-                } else {
+-                    (kCGEventMouseMoved, 0)
+-                };
++                let (ty, b) = self.motion_type();
+                 self.mouse(ty, b);
+             }
++            InputEvent::MoveRel { dx, dy } => {
++                let Some(g) = *super::GEOMETRY.lock() else {
++                    return;
++                };
++                // Desktop pixels -> points. The cursor moves by the exact amount; the
++                // delta fields carry whole points, with the remainder kept for later.
++                let k = 1.0 / g.scale();
++                let (mx, my) = (dx as f64 * k, dy as f64 * k);
++                self.rel_acc.0 += mx;
++                self.rel_acc.1 += my;
++                let (ix, iy) = (self.rel_acc.0.trunc(), self.rel_acc.1.trunc());
++                self.rel_acc.0 -= ix;
++                self.rel_acc.1 -= iy;
++                let b = g.bounds;
++                let at = self.cursor_location();
++                self.pos = CGPoint {
++                    x: (at.x + mx).clamp(b.origin.x, b.origin.x + b.size.width - 1.0),
++                    y: (at.y + my).clamp(b.origin.y, b.origin.y + b.size.height - 1.0),
++                };
++                let (ty, button) = self.motion_type();
++                self.mouse_delta(ty, button, Some((ix as i64, iy as i64)));
++            }
+             InputEvent::Button { button, down } => {
+                 let b = button as usize;
+                 if b >= self.buttons.len() || self.buttons[b] == down {
+@@ -457,6 +514,7 @@ pub fn spawn(
+         last_click: (Instant::now(), CGPoint::default(), 0),
+         clicks: 1,
+         scroll_acc: (0.0, 0.0),
++        rel_acc: (0.0, 0.0),
+         clipboard,
+     };
+     let (tx, rx) = mpsc::channel::<InputEvent>();
+diff --git a/src/server.rs b/src/server.rs
+index 9344529..114601d 100644
+--- a/src/server.rs
++++ b/src/server.rs
+@@ -328,6 +328,12 @@ fn handle_text(s: &AppState, c: &Arc<Client>, t: &str, rtts: &mut std::collectio
+                 input(InputEvent::Move { x, y });
+             }
+         }
++        // mr,dx,dy: relative motion in desktop pixels (game mode, pointer locked).
++        "mr" => {
++            if let (Some(dx), Some(dy)) = (num(&mut it), num(&mut it)) {
++                input(InputEvent::MoveRel { dx, dy });
++            }
++        }
+         "b" => {
+             if let (Some(button), Some(d)) = (num::<u8>(&mut it), num::<u8>(&mut it)) {
+                 input(InputEvent::Button {
+@@ -424,6 +430,7 @@ mod tests {
+     const ALL: &[&str] = &[
+         "a,1",
+         "m,10,20",
++        "mr,5,-3",
+         "b,1,1",
+         "b,1,0",
+         "s,0,1",
+@@ -440,9 +447,15 @@ mod tests {
+         "po,1",
+     ];
+ 
+-    /// Sends every command to a server that has input, a microphone and resizing wired
+-    /// up, and returns (input events, microphone messages, a resize was asked for).
+-    fn drive(read_only: bool) -> (usize, usize, bool) {
++    type Fixture = (
++        AppState,
++        Arc<Client>,
++        std::sync::mpsc::Receiver<InputEvent>,
++        std::sync::mpsc::Receiver<crate::mic::MicMsg>,
++    );
++
++    /// A server with input, a microphone and resizing wired up, and one client.
++    fn fixture(read_only: bool) -> Fixture {
+         let hub = Hub::new();
+         hub.width.store(1280, Ordering::Relaxed);
+         hub.height.store(800, Ordering::Relaxed);
+@@ -471,11 +484,18 @@ mod tests {
+         };
+         let (tx, _rx) = mpsc::unbounded_channel();
+         let client = hub.add_client(tx);
++        (s, client, input_rx, mic_rx)
++    }
++
++    /// Sends every command to `fixture` and returns (input events, microphone
++    /// messages, a resize was asked for).
++    fn drive(read_only: bool) -> (usize, usize, bool) {
++        let (s, client, input_rx, mic_rx) = fixture(read_only);
+         let mut rtts = Default::default();
+         for c in ALL {
+             handle_text(&s, &client, c, &mut rtts);
+         }
+-        let resized = hub.resize_req.lock().is_some();
++        let resized = s.hub.resize_req.lock().is_some();
+         (
+             input_rx.try_iter().count(),
+             mic_rx.try_iter().count(),
+@@ -483,6 +503,38 @@ mod tests {
+         )
+     }
+ 
++    #[test]
++    fn relative_motion_is_parsed() {
++        let (s, client, input_rx, _mic_rx) = fixture(false);
++        let mut rtts = Default::default();
++        for c in [
++            "mr,5,-3",
++            "mr,-120,0",
++            // Malformed: missing, fractional or non-numeric deltas are ignored.
++            "mr,5",
++            "mr",
++            "mr,1.5,2",
++            "mr,a,b",
++        ] {
++            handle_text(&s, &client, c, &mut rtts);
++        }
++        let got: Vec<(i32, i32)> = input_rx
++            .try_iter()
++            .map(|ev| match ev {
++                InputEvent::MoveRel { dx, dy } => (dx, dy),
++                _ => panic!("expected only relative motion"),
++            })
++            .collect();
++        assert_eq!(got, [(5, -3), (-120, 0)]);
++    }
++
++    #[test]
++    fn read_only_viewers_cannot_move_relatively() {
++        let (s, client, input_rx, _mic_rx) = fixture(true);
++        handle_text(&s, &client, "mr,5,-3", &mut Default::default());
++        assert_eq!(input_rx.try_iter().count(), 0);
++    }
++
+     #[test]
+     fn read_only_viewers_cannot_act_on_the_desktop() {
+         let (input, mic, resized) = drive(true);
+@@ -496,7 +548,7 @@ mod tests {
+         // The same commands do reach the desktop without --read-only, so the test above
+         // checks the guard rather than an unwired server.
+         let (input, mic, resized) = drive(false);
+-        assert!(input >= 9, "{input} input events");
++        assert!(input >= 10, "{input} input events");
+         assert_eq!(mic, 1);
+         assert!(resized);
+     }
+diff --git a/src/win/input.rs b/src/win/input.rs
+index 5aa0201..9ea80d4 100644
+--- a/src/win/input.rs
++++ b/src/win/input.rs
+@@ -18,6 +18,11 @@ pub enum InputEvent {
+         x: i32,
+         y: i32,
+     },
++    /// Relative motion in desktop pixels (game mode, pointer locked in the viewer).
++    MoveRel {
++        dx: i32,
++        dy: i32,
++    },
+     Button {
+         button: u8,
+         down: bool,
+@@ -302,6 +307,9 @@ impl Injector {
+                     MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                 )]);
+             }
++            // Relative: games reading raw input see the deltas, and the cursor moves
++            // by them (subject to the remote's pointer speed settings).
++            InputEvent::MoveRel { dx, dy } => send(&[mouse_input(dx, dy, 0, MOUSEEVENTF_MOVE)]),
+             InputEvent::Button { button, down } => {
+                 let b = button as usize;
+                 if b >= self.buttons.len() || self.buttons[b] == down {
+diff --git a/web/index.html b/web/index.html
+index 0f87033..c31fb3d 100644
+--- a/web/index.html
++++ b/web/index.html
+@@ -205,7 +205,9 @@
+ 				display: inline-grid !important;
+ 			}
+ 			/* Read-only: nothing on the desktop accepts what the keyboard would send. */
+-			#tools.read-only #kb-btn {
++			#tools.read-only #kb-btn,
++			#tools.read-only #game-btn,
++			#tools.touch #game-btn {
+ 				display: none !important;
+ 			}
+ 			/* While the microphone is live the toolbar stays up as a recording indicator. */
+@@ -540,6 +542,69 @@
+ 				color: var(--text-weak);
+ 			}
+ 
++			/* Game mode paused: a dialog-style card over a scrim, above everything. */
++			#game-pause {
++				position: fixed;
++				inset: 0;
++				z-index: 6;
++				display: none;
++				align-items: center;
++				justify-content: center;
++				background: #000000a6;
++			}
++			#game-pause.show {
++				display: flex;
++			}
++			#game-pause .frame {
++				padding: 4px;
++				background: var(--surface-secondary);
++				border: 1px solid var(--border-default);
++				border-radius: 16px;
++				box-shadow: var(--shadow-lg);
++			}
++			#game-pause .inner {
++				display: flex;
++				flex-direction: column;
++				align-items: center;
++				gap: 12px;
++				padding: 24px 32px;
++				min-width: 200px;
++				background: var(--surface-raised);
++				border-radius: 12px;
++				box-shadow: var(--shadow-white-border);
++				font: 520 13px/16px var(--font);
++				letter-spacing: -0.2px;
++				color: var(--text-weak);
++			}
++			#game-pause h2 {
++				margin: 0;
++				color: var(--text-title);
++				font-size: 20px;
++				line-height: 28px;
++				font-weight: 600;
++			}
++			#game-pause .row {
++				display: flex;
++				gap: 8px;
++			}
++			#game-pause .btn {
++				height: 32px;
++				padding: 4px 14px;
++			}
++			#game-pause .btn.ghost {
++				color: var(--text-strong);
++				background: var(--fill-tertiary);
++			}
++			#game-pause .btn.ghost:hover {
++				background: var(--fill-tertiary-hover);
++			}
++			#game-note {
++				color: var(--text-strong);
++			}
++			#game-note:empty {
++				display: none;
++			}
++
+ 			/* Drop target: a dialog-style card over a scrim. */
+ 			#drop {
+ 				position: fixed;
+@@ -661,6 +726,22 @@
+ 						stroke-linejoin="round" />
+ 				</svg>
+ 			</button>
++			<button
++				id="game-btn"
++				class="ib"
++				type="button"
++				title="Game mode: click the desktop to lock the mouse (hold W + P to pause)"
++				aria-label="Game mode"
++				aria-pressed="false">
++				<svg class="i" viewBox="0 0 24 24" fill="none">
++					<path
++						d="M6 11H10M8 9V13M15 12H15.01M18 10H18.01M7 6H17C19.7614 6 22 8.23858 22 11V13C22 15.7614 19.7614 18 17 18C15.5 18 14.5 17 13.5 16H10.5C9.5 17 8.5 18 7 18C4.23858 18 2 15.7614 2 13V11C2 8.23858 4.23858 6 7 6Z"
++						stroke="currentColor"
++						stroke-width="2"
++						stroke-linecap="round"
++						stroke-linejoin="round" />
++				</svg>
++			</button>
+ 			<button
+ 				id="fs-btn"
+ 				class="ib"
+@@ -798,6 +879,23 @@
+ 				</div>
+ 			</div>
+ 		</div>
++		<div id="game-pause" role="dialog" aria-label="Paused">
++			<div class="frame">
++				<div class="inner">
++					<h2>Paused</h2>
++					<div class="row">
++						<button id="game-resume" class="btn primary" type="button">
++							<span>Resume</span>
++						</button>
++						<button id="game-leave" class="btn ghost" type="button">
++							<span>Leave</span>
++						</button>
++					</div>
++					<span id="game-note" role="status"></span>
++					<span>Hold W + P to pause</span>
++				</div>
++			</div>
++		</div>
+ 		<div id="status">Connecting…</div>
+ 		<div id="stats"></div>
+ 		<script src="client.js"></script>
+diff --git a/web/src/client/app.ts b/web/src/client/app.ts
+index 429f035..58d4a7d 100644
+--- a/web/src/client/app.ts
++++ b/web/src/client/app.ts
+@@ -22,6 +22,15 @@ export interface App {
+ 	desk: { w: number; h: number };
+ 	/** On-screen CSS pixels per desktop pixel. */
+ 	view: { scale: number };
++	/** Game mode (game.ts): relative mouse with the pointer locked, and the pause state. */
++	game: {
++		/** Game mode is on (`?game=1` or the toolbar button). */
++		on: boolean;
++		/** The pointer is locked to the desktop: motion is sent relative. */
++		locked: boolean;
++		/** Paused: input commands are dropped until the viewer resumes. */
++		paused: boolean;
++	};
+ }
+ 
+ export function el<T extends HTMLElement = HTMLElement>(id: string): T {
+diff --git a/web/src/client/game.ts b/web/src/client/game.ts
+new file mode 100644
+index 0000000..99cdec6
+--- /dev/null
++++ b/web/src/client/game.ts
+@@ -0,0 +1,147 @@
++// Game mode (?game=1, or the toolbar button): a click locks the pointer to the desktop
++// and the mouse sends relative motion, for games with mouse-look. Hold W and press P,
++// or lose the lock any other way (Esc, switching windows), to pause: held keys and
++// buttons are released, input stops, and an overlay offers Resume and Leave.
++import { cmd } from '../protocol';
++import type { App } from './app';
++import { el } from './app';
++
++export interface Game {
++	/** A mouse press on the desktop: true when it was taken to lock the pointer. */
++	takeClick(e: PointerEvent): boolean;
++	/** Pointer motion while locked. */
++	motion(e: PointerEvent): void;
++	pause(): void;
++}
++
++/** `release` sends key-ups and button-ups for everything the page thinks is held. */
++export function createGame(app: App, release: () => void): Game {
++	const { surface } = app;
++	const btn = el<HTMLButtonElement>('game-btn');
++	const overlay = el('game-pause');
++	const resumeBtn = el<HTMLButtonElement>('game-resume');
++	const leaveBtn = el<HTMLButtonElement>('game-leave');
++	const note = el('game-note');
++	const canLock = 'requestPointerLock' in surface;
++
++	// Relative motion in desktop pixels, sent once per frame in whole pixels; the
++	// fractions carry over.
++	let ax = 0,
++		ay = 0,
++		queued = false;
++	function flush() {
++		queued = false;
++		const dx = Math.trunc(ax),
++			dy = Math.trunc(ay);
++		if (!dx && !dy) return;
++		ax -= dx;
++		ay -= dy;
++		app.send(cmd.moveRel(dx, dy));
++	}
++	function motion(e: PointerEvent) {
++		if (!app.desk.w || app.game.paused) return;
++		// movementX/Y are CSS pixels: devicePixelRatio device pixels each, while the
++		// desktop shows desk.w / width desktop pixels per CSS pixel, i.e. that over dpr
++		// per device pixel. The two dprs cancel, so the remote cursor moves as far
++		// across the shown desktop as the local mouse moved on screen.
++		const k = app.desk.w / surface.getBoundingClientRect().width;
++		ax += e.movementX * k;
++		ay += e.movementY * k;
++		if (!queued) {
++			queued = true;
++			requestAnimationFrame(flush);
++		}
++	}
++
++	async function lock(): Promise<boolean> {
++		try {
++			// Raw mouse counts, without the local pointer acceleration, where supported.
++			await surface.requestPointerLock({ unadjustedMovement: true });
++		} catch {
++			try {
++				await surface.requestPointerLock();
++			} catch (err) {
++				console.warn('[voxl] pointer lock failed', err);
++				return false;
++			}
++		}
++		return true;
++	}
++
++	function showOverlay(show: boolean) {
++		overlay.classList.toggle('show', show);
++		if (show) resumeBtn.focus({ preventScroll: true });
++		else app.kbd.focus({ preventScroll: true });
++	}
++
++	function pause() {
++		if (app.game.paused) return;
++		// Release while input still goes out, then stop it.
++		release();
++		app.game.paused = true;
++		ax = ay = 0;
++		if (document.pointerLockElement === surface) document.exitPointerLock();
++		note.textContent = '';
++		showOverlay(true);
++	}
++
++	function resumed() {
++		app.game.paused = false;
++		ax = ay = 0;
++		note.textContent = '';
++		showOverlay(false);
++	}
++
++	function setOn(on: boolean) {
++		app.game.on = on;
++		btn.classList.toggle('on', on);
++		btn.setAttribute('aria-pressed', String(on));
++		if (on) return;
++		if (app.game.paused) resumed();
++		if (document.pointerLockElement === surface) document.exitPointerLock();
++	}
++
++	document.addEventListener('pointerlockchange', () => {
++		const locked = document.pointerLockElement === surface;
++		if (locked === app.game.locked) return;
++		app.game.locked = locked;
++		if (locked) resumed();
++		// Esc, switching windows or the browser taking the lock back: same as W + P.
++		else if (app.game.on) pause();
++	});
++
++	resumeBtn.addEventListener('click', async () => {
++		note.textContent = '';
++		// Browsers refuse a new lock right after the viewer pressed Esc.
++		if (!(await lock()) && app.game.paused)
++			note.textContent = 'Click Resume again';
++	});
++	leaveBtn.addEventListener('click', () => {
++		window.close();
++		// Scripts may only close windows they opened; a normal tab stays.
++		setTimeout(() => {
++			if (!window.closed) note.textContent = 'You can close this tab';
++		}, 250);
++	});
++
++	if (!canLock) btn.style.display = 'none';
++	btn.addEventListener('click', () => setOn(!app.game.on));
++	setOn(new URLSearchParams(location.search).get('game') === '1');
++
++	return {
++		takeClick(e) {
++			if (
++				!canLock ||
++				!app.game.on ||
++				app.game.locked ||
++				app.readOnly ||
++				e.pointerType !== 'mouse'
++			)
++				return false;
++			void lock();
++			return true;
++		},
++		motion,
++		pause,
++	};
++}
+diff --git a/web/src/client/keyboard.ts b/web/src/client/keyboard.ts
+index 4d091e7..20fa86e 100644
+--- a/web/src/client/keyboard.ts
++++ b/web/src/client/keyboard.ts
+@@ -3,6 +3,7 @@
+ import { Bin, cmd } from '../protocol';
+ import type { App } from './app';
+ import type { Clipboard } from './clipboard';
++import type { Game } from './game';
+ 
+ const NAMED: Record<string, number> = {
+ 	Backspace: 0xff08,
+@@ -50,7 +51,8 @@ async function toPng(file: File): Promise<ArrayBuffer> {
+ export function setupKeyboard(
+ 	app: App,
+ 	clipboard: Clipboard,
+-	onInteract: () => void
++	onInteract: () => void,
++	game: Game
+ ) {
+ 	const { kbd, surface, send, isMac } = app;
+ 	const XK_CONTROL_L = 0xffe3,
+@@ -117,6 +119,16 @@ export function setupKeyboard(
+ 		down.clear();
+ 		send(cmd.releaseAll);
+ 	}
++	/** Key-ups for every key held on the desktop (game mode pausing). */
++	function releaseHeld() {
++		if (pendingPaste) {
++			clearTimeout(pendingPaste.timer);
++			pendingPaste = null;
++		}
++		for (const code of down.keys()) release(code);
++	}
++	/** P of the W + P pause chord went down: its keyup stays here too. */
++	let chordUp = false;
+ 	function flushPaste() {
+ 		if (!pendingPaste) return;
+ 		const p = pendingPaste;
+@@ -126,7 +138,14 @@ export function setupKeyboard(
+ 	}
+ 
+ 	function onKeyDown(e: KeyboardEvent) {
+-		if (e.isComposing) return;
++		if (e.isComposing || app.game.paused) return;
++		// Game mode: P while W is held pauses (physical keys, whatever the layout).
++		if (app.game.on && e.code === 'KeyP' && down.has('KeyW')) {
++			e.preventDefault();
++			chordUp = true;
++			game.pause();
++			return;
++		}
+ 		onInteract();
+ 		const ks = keysymOf(e);
+ 		if (!ks) return;
+@@ -147,6 +166,10 @@ export function setupKeyboard(
+ 	}
+ 	function onKeyUp(e: KeyboardEvent) {
+ 		e.preventDefault();
++		if (chordUp && e.code === 'KeyP') {
++			chordUp = false;
++			return;
++		}
+ 		if (pendingPaste && pendingPaste.code === e.code) flushPaste();
+ 		release(e.code);
+ 		// macOS swallows keyups of keys released while Cmd is held.
+@@ -218,5 +241,5 @@ export function setupKeyboard(
+ 	surface.addEventListener('focus', () => kbd.focus({ preventScroll: true }));
+ 	if (!app.inIframe) kbd.focus({ preventScroll: true });
+ 
+-	return { releaseAll };
++	return { releaseAll, releaseHeld };
+ }
+diff --git a/web/src/client/main.ts b/web/src/client/main.ts
+index 2f3c5cc..bdf9674 100644
+--- a/web/src/client/main.ts
++++ b/web/src/client/main.ts
+@@ -8,6 +8,7 @@ import { createAudio } from './audio';
+ import { createClipboard } from './clipboard';
+ import { createCursor } from './cursor';
+ import { createFiles } from './files';
++import { createGame } from './game';
+ import { setupKeyboard } from './keyboard';
+ import { createMic } from './mic';
+ import { setupPointer } from './pointer';
+@@ -24,8 +25,13 @@ import { createVideo } from './video';
+  */
+ const READ_ONLY_COMMANDS = new Set(['a', 'v', 'au', 'kf', 'po']);
+ 
++/** Commands that drive the desktop's mouse and keyboard: dropped while game mode is paused. */
++const INPUT_COMMANDS = new Set(['m', 'mr', 'b', 's', 'sp', 'k']);
++
+ function blocksInput(app: App, command: string): boolean {
+-	return app.readOnly && !READ_ONLY_COMMANDS.has(command.split(',')[0]);
++	const name = command.split(',')[0];
++	if (app.game.paused && INPUT_COMMANDS.has(name)) return true;
++	return app.readOnly && !READ_ONLY_COMMANDS.has(name);
+ }
+ 
+ function main() {
+@@ -78,6 +84,7 @@ function main() {
+ 		inIframe: window !== window.top,
+ 		desk: { w: 0, h: 0 },
+ 		view: { scale: 1 },
++		game: { on: false, locked: false, paused: false },
+ 	};
+ 
+ 	const cursor = createCursor(app);
+@@ -92,8 +99,14 @@ function main() {
+ 		audio.start();
+ 		clipboard.flush();
+ 	};
+-	setupPointer(app, onInteract);
+-	setupKeyboard(app, clipboard, onInteract);
++	// Pausing game mode lets go of everything held, then stops input.
++	const game = createGame(app, () => {
++		pointer.releaseButtons();
++		keyboard.releaseHeld();
++		app.send(cmd.releaseAll);
++	});
++	const pointer = setupPointer(app, onInteract, game);
++	const keyboard = setupKeyboard(app, clipboard, onInteract, game);
+ 	setupToolbar(app, video.layout);
+ 	const files = createFiles(app);
+ 	const mic = createMic(app);
+diff --git a/web/src/client/pointer.ts b/web/src/client/pointer.ts
+index ac7ba6b..a4e1af6 100644
+--- a/web/src/client/pointer.ts
++++ b/web/src/client/pointer.ts
+@@ -1,13 +1,16 @@
+ // Mouse, wheel/trackpad and touch input on the desktop surface.
+ import { cmd } from '../protocol';
+ import type { App } from './app';
++import type { Game } from './game';
+ import { createTouch } from './touch';
+ 
+ /** DOM button -> X button (left, middle, right, back, forward). */
+ const BUTTONS = [1, 2, 3, 8, 9];
+ 
+-export function setupPointer(app: App, onInteract: () => void) {
++export function setupPointer(app: App, onInteract: () => void, game: Game) {
+ 	const { surface, send } = app;
++	/** X buttons pressed on the desktop, released when game mode pauses. */
++	const held = new Set<number>();
+ 
+ 	function toDesk(p: { clientX: number; clientY: number }): [number, number] {
+ 		const r = surface.getBoundingClientRect();
+@@ -20,7 +23,8 @@ export function setupPointer(app: App, onInteract: () => void) {
+ 	}
+ 	let lastMove = '';
+ 	function move(p: { clientX: number; clientY: number }, force = false) {
+-		if (!app.desk.w) return;
++		// A locked pointer has no position: motion goes out relative (game.ts).
++		if (!app.desk.w || app.game.locked) return;
+ 		const s = cmd.move(...toDesk(p));
+ 		if (s !== lastMove || force) {
+ 			lastMove = s;
+@@ -57,6 +61,7 @@ export function setupPointer(app: App, onInteract: () => void) {
+ 
+ 	surface.addEventListener('pointermove', (e) => {
+ 		if (e.pointerType === 'touch') touch.move(e);
++		else if (app.game.locked) game.motion(e);
+ 		else move(e);
+ 	});
+ 	surface.addEventListener('pointerdown', (e) => {
+@@ -67,11 +72,15 @@ export function setupPointer(app: App, onInteract: () => void) {
+ 			return;
+ 		}
+ 		app.kbd.focus({ preventScroll: true });
++		// Game mode: the first click only locks the pointer.
++		if (game.takeClick(e)) return;
+ 		move(e);
+ 		try {
+ 			surface.setPointerCapture(e.pointerId);
+ 		} catch {}
+-		send(cmd.button(BUTTONS[e.button] || 1, true));
++		const b = BUTTONS[e.button] || 1;
++		held.add(b);
++		send(cmd.button(b, true));
+ 	});
+ 	surface.addEventListener('pointerup', (e) => {
+ 		e.preventDefault();
+@@ -80,11 +89,17 @@ export function setupPointer(app: App, onInteract: () => void) {
+ 			return;
+ 		}
+ 		move(e);
+-		send(cmd.button(BUTTONS[e.button] || 1, false));
++		const b = BUTTONS[e.button] || 1;
++		// Not the release of the click that locked the pointer.
++		if (!held.delete(b) && app.game.on) return;
++		send(cmd.button(b, false));
+ 	});
+ 	surface.addEventListener('pointercancel', (e) => {
+ 		if (e.pointerType === 'touch') touch.cancel(e);
+-		else send(cmd.releaseAll);
++		else {
++			held.clear();
++			send(cmd.releaseAll);
++		}
+ 	});
+ 	surface.addEventListener('contextmenu', (e) => e.preventDefault());
+ 	surface.addEventListener(
+@@ -98,4 +113,14 @@ export function setupPointer(app: App, onInteract: () => void) {
+ 		},
+ 		{ passive: false }
+ 	);
++	// The keyboard module sends releaseAll on blur, which lets go of buttons too.
++	window.addEventListener('blur', () => held.clear());
++
++	return {
++		/** Button-ups for every button held on the desktop. */
++		releaseButtons() {
++			for (const b of held) send(cmd.button(b, false));
++			held.clear();
++		},
++	};
+ }
+diff --git a/web/src/protocol.ts b/web/src/protocol.ts
+index 1c62231..a3ca824 100644
+--- a/web/src/protocol.ts
++++ b/web/src/protocol.ts
+@@ -59,6 +59,8 @@ export type ServerMessage =
+ export const cmd = {
+ 	ack: (frame: number) => `a,${frame}`,
+ 	move: (x: number, y: number) => `m,${x},${y}`,
++	/** Relative motion in whole desktop pixels (game mode, pointer locked). */
++	moveRel: (dx: number, dy: number) => `mr,${dx},${dy}`,
+ 	button: (button: number, down: boolean) => `b,${button},${down ? 1 : 0}`,
+ 	/** Scroll in desktop pixels; the server turns it into smooth scrolling or wheel clicks. */
+ 	scroll: (dx: number, dy: number) => `sp,${dx.toFixed(1)},${dy.toFixed(1)}`,

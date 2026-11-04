@@ -1,0 +1,79 @@
+{
+  "name": "screenbridge",
+  "productName": "ScreenBridge",
+  "version": "0.1.0",
+  "description": "Share your screen or watch another computer's screen over your home Wi-Fi. Built on voxl.",
+  "main": "src/main.js",
+  "author": "uhrichsam4",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "test": "node test/share-test.js",
+    "dist:mac": "electron-builder --mac",
+    "dist:win": "electron-builder --win"
+  },
+  "devDependencies": {
+    "electron": "45.2.2",
+    "electron-builder": "26.18.0"
+  },
+  "build": {
+    "appId": "com.uhrichsam4.screenbridge",
+    "productName": "ScreenBridge",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/bin",
+        "to": "bin"
+      }
+    ],
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "category": "public.app-category.utilities",
+      "identity": "-",
+      "hardenedRuntime": false,
+      "notarize": false,
+      "extendInfo": {
+        "NSScreenCaptureUsageDescription": "ScreenBridge shares this screen with the computer you choose.",
+        "NSAccessibilityUsageDescription": "ScreenBridge lets the computer watching this screen use the mouse and keyboard."
+      }
+    },
+    "dmg": {
+      "artifactName": "ScreenBridge-${version}-mac-${arch}.${ext}"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "artifactName": "ScreenBridge-Setup-${version}.${ext}"
+    }
+  }
+}

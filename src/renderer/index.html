@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'">
+  <title>ScreenBridge</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>ScreenBridge</h1>
+    <p class="sub">Share this screen, or watch another computer on your Wi-Fi.</p>
+  </header>
+
+  <section id="share">
+    <h2>Share this computer</h2>
+    <p class="warn">Only share on a network you trust (home Wi-Fi). The stream isn't encrypted.</p>
+
+    <button id="shareBtn" class="big primary">Start sharing</button>
+    <p id="shareStatus" class="status"></p>
+
+    <div id="shareInfo" hidden>
+      <p class="label">On the other computer, open ScreenBridge and type:</p>
+      <div class="pair">
+        <span class="k">Address</span>
+        <span id="addresses" class="v"></span>
+      </div>
+      <div class="pair">
+        <span class="k">Password</span>
+        <span id="password" class="v mono"></span>
+      </div>
+      <button id="newPwBtn" class="small">New password</button>
+    </div>
+
+    <div id="screenHelp" class="help" hidden>
+      <p><strong>ScreenBridge needs permission to share your screen.</strong>
+        In System Settings, turn on ScreenBridge under <em>Screen &amp; System Audio Recording</em>,
+        then quit and reopen ScreenBridge and press Start sharing again.</p>
+      <button data-settings="screen">Open Screen Recording settings</button>
+    </div>
+    <div id="axHelp" class="help soft" hidden>
+      <p>The other computer can watch, but can't use your mouse and keyboard yet.
+        To allow that, turn on ScreenBridge under <em>Accessibility</em>, then stop and start sharing again.</p>
+      <button data-settings="accessibility">Open Accessibility settings</button>
+    </div>
+    <div id="exitHelp" class="help" hidden>
+      <p id="exitText"></p>
+      <details><summary>Details</summary><pre id="exitLog"></pre></details>
+    </div>
+  </section>
+
+  <section id="watch">
+    <h2>Watch another computer</h2>
+    <form id="watchForm">
+      <label>Address
+        <input id="address" placeholder="192.168.0.10" autocomplete="off" spellcheck="false">
+      </label>
+      <label>Password
+        <input id="watchPassword" placeholder="abcd-efgh-jkmn" autocomplete="off" spellcheck="false">
+      </label>
+      <div class="game">
+        <label class="check"><input id="gameMode" type="checkbox" checked> Game mode</label>
+        <p class="hint">Click the stream to lock the mouse. Hold W and press P to pause and free the mouse.</p>
+      </div>
+      <button id="connectBtn" type="submit" class="big primary">Connect</button>
+    </form>
+    <p id="watchStatus" class="status"></p>
+  </section>
+
+  <footer>Built on <span class="mono">voxl</span> by tembo (MIT)</footer>
+  <script src="app.js"></script>
+</body>
+</html>
